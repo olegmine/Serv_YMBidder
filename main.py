@@ -33,8 +33,9 @@ class MarketplaceConfig:
                  market_name: Optional[str] = None,
                  user_email: Optional[str] = None,
                  phone_number: Optional[str] = None,
-                 price_decrease_lower: Optional[int] = None,  # Нижний диапазон снижения цены
-                 price_decrease_upper: Optional[int] = None): # Верхний диапазон снижения цены
+                 price_decrease_lower: Optional[int] = None,
+                 price_decrease_upper: Optional[int] = None,
+                 market_white_list: Optional[str] = None):  # Добавлен новый параметр
         self.user_id = user_id
         self.sample_spreadsheet_id = sample_spreadsheet_id
         self.update_interval_minutes = int(update_interval_minutes)
@@ -46,6 +47,8 @@ class MarketplaceConfig:
         self.phone_number = phone_number
         self.price_decrease_lower = int(price_decrease_lower) if price_decrease_lower is not None else None
         self.price_decrease_upper = int(price_decrease_upper) if price_decrease_upper is not None else None
+        # Преобразование строки с разделителями-запятыми в список
+        self.market_white_list = [x.strip() for x in market_white_list.split(',')] if market_white_list else []
     def get_user_info(self) -> str:
         """Возвращает информацию о пользователе для логов"""
         return f"[ID: {self.user_id}, Email: {self.user_email}, Тел: {self.phone_number}]"
@@ -72,7 +75,10 @@ async def process_yandex_market_data(session: aiohttp.ClientSession, config: Mar
         raise ValueError("Отсутствуют необходимые параметры конфигурации")
 
     try:
-        my_market = ['SSmart shop', 'Tech PC Components', 'ByMarket']
+        if config.market_white_list :
+            my_market = config.market_white_list
+        else:
+            my_market = ['sample']
         # Инициализация параметров
         market_config = {
             'spreadsheet_id': config.sample_spreadsheet_id,
@@ -218,8 +224,9 @@ def get_users_config_from_excel(filename: str) -> list:
             'MARKET_NAME',
             'USER_EMAIL',
             'PHONE_NUMBER',
-            'PRICE_DECREASE_LOWER',  # Новый параметр
-            'PRICE_DECREASE_UPPER'   # Новый параметр
+            'PRICE_DECREASE_LOWER',
+            'PRICE_DECREASE_UPPER',
+            'MARKET_WHITE_LIST'
         ]
 
         for row_idx, row in enumerate(sheet.iter_rows(min_row=2), start=2):
@@ -251,8 +258,9 @@ def get_users_config_from_excel(filename: str) -> list:
                     market_name=params.get('market_name'),
                     user_email=params.get('user_email'),
                     phone_number=params.get('phone_number'),
-                    price_decrease_lower=params.get('price_decrease_lower'),  # Новый параметр
-                    price_decrease_upper=params.get('price_decrease_upper')   # Новый параметр
+                    price_decrease_lower=params.get('price_decrease_lower'),
+                    price_decrease_upper=params.get('price_decrease_upper'),
+                    market_white_list=params.get('market_white_list')  # Добавлен новый параметр
                 )
                 user_configs.append(config)
 

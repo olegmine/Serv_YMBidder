@@ -331,7 +331,7 @@ async def compare_prices_and_create_for_update(
                         f"Оптимальная цена mp_on_market ({row[column_names['mp_on_market']]:.2f}) "
                         f"ниже или равна минимальной stop ({row[column_names['stop']]:.2f})"
                     )
-                    logger.warning(warning_msg, username=username, marketname=marketname)
+                    logger.info(warning_msg, username=username, marketname=marketname)
                     updated_df.loc[index, column_names['prim']] = warning_msg
                     # Добавляем в failed_attempts
                     failed_attempts_df = pd.concat([
@@ -360,7 +360,7 @@ async def compare_prices_and_create_for_update(
             )
 
         if 'discount_base' not in for_update.columns:
-            logger.warning(
+            logger.info(
                 "Колонка 'discount_base' отсутствует в DataFrame for_update",
                 username=username,
                 marketname=marketname

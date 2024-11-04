@@ -111,7 +111,7 @@ async def get_yandex_market_report(api_key, business_id):
         report_id = report_info['result']['reportId']
         estimated_time = report_info['result']['estimatedGenerationTime'] / 1000
 
-        logger.warning(f"Генерация отчета начата. ID отчета: {report_id}")
+        logger.info(f"Генерация отчета начата. ID отчета: {report_id}")
         logger.info(f"Ожидаемое время генерации: {estimated_time} секунд")
 
         # Ожидание генерации отчета
@@ -140,7 +140,7 @@ async def get_yandex_market_report(api_key, business_id):
                 logger.info("Отчет все еще генерируется...")
 
         # Скачивание отчета
-        logger.warning("Начало скачивания отчета")
+        logger.info("Начало скачивания отчета")
         report_content = await download_report(session, api_key, file_url)
         if report_content:
             # Обработка CSV-данных из ZIP-архива
