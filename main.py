@@ -67,8 +67,7 @@ async def save_debug_csv(df: pd.DataFrame, filename: str) -> None:
 async def process_yandex_market_data(session: aiohttp.ClientSession, config: MarketplaceConfig) -> Dict[str, Any]:
     """Обработка данных Яндекс.Маркета"""
     ym_logger = logger.bind(marketplace="YandexMarket")
-    ym_flag = None
-    sheets_flag = None
+
 
     # Валидация входных данных
     if not all([config.sample_spreadsheet_id, config.market_name, config.yandex_market_range,
@@ -114,11 +113,10 @@ async def process_yandex_market_data(session: aiohttp.ClientSession, config: Mar
             # Получение данных из Google Sheets
             ym_logger.info(f"Получение данных из Google Sheets для {market_config['range_name']}")
             df_from_sheets = await get_sheet_data(market_config['spreadsheet_id'], market_config['sheet_range'])
-            sheets_flag = True
             current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
             await save_debug_csv(df_from_sheets, f"report/{market_config['range_name']}{current_time}_first.csv")
         except Exception as e:
-            sheets_flag = False
+            df_from_sheets = None
             ym_logger.error(f"Не удалось получить данные из Гугл таблиц для пользователя {config.user_id} "
                             f"с email {config.user_email}")
 
@@ -155,13 +153,12 @@ async def process_yandex_market_data(session: aiohttp.ClientSession, config: Mar
                     }
                 )
             await save_debug_csv(ym_report_df, f"report/{market_config['range_name']}{current_time}_ym_report.csv")
-            ym_flag = True
         except Exception as e:
-            ym_flag = False
+            ym_report_df = None
             ym_logger.error(f"Ошибка при получении отчета с Яндекс.Маркета: {str(e)}")
             raise
 
-        if ym_flag == True and sheets_flag == False:
+        if ym_report_df is not None and df_from_sheets is None:
             df_for_write = await first_write_df(ym_report_df)
             ym_logger.warning(
                 f"Таблица Google пуста для клиента {config.user_id}, записываю данные из личного кабинета"
@@ -179,7 +176,7 @@ async def process_yandex_market_data(session: aiohttp.ClientSession, config: Mar
                 config.yandex_market_range
             )
 
-        if ym_flag == True and sheets_flag == True:
+        if ym_report_df is not None and df_from_sheets is not None:
             # Обновление и сравнение данных
             try:
                 df_from_sheets = df_from_sheets.iloc[1:].copy()
@@ -189,7 +186,6 @@ async def process_yandex_market_data(session: aiohttp.ClientSession, config: Mar
                                                     column_names=COLUMNS_FULL,
                                                     user_name=config.user_id,
                                                     market_name=config.market_name)
-                updated_df.to_csv(f"{config.market_name}.csv")
             except Exception as e:
                 ym_logger.error(f"Ошибка при обновлении данных: {str(e)}")
                 raise
