@@ -3,28 +3,40 @@ from .auth import get_credentials
 from googleapiclient.discovery import build
 import sqlite3
 import traceback
-from .logger import logger  # Импорт логгера
+import sys
+import os
 
-async def get_sheet_data(spreadsheet_id, range_name):
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from scr.logger import logger
+
+
+async def get_sheet_data(spreadsheet_id: str, range_name: str) -> pd.DataFrame | None:
     """Получает данные из Google Sheets и возвращает их в виде pandas DataFrame"""
-    creds = await get_credentials()
-    service = build('sheets', 'v4', credentials=creds)
-
     try:
-        result = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id,
-                                                    range=range_name).execute()
+        creds = await get_credentials()
+        service = build('sheets', 'v4', credentials=creds, cache_discovery=False)  # Добавлен cache_discovery=False
+
+        logger.info(f"Получение данных из таблицы {spreadsheet_id}, диапазон {range_name}")
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=range_name,
+            valueRenderOption='UNFORMATTED_VALUE'  # Добавлена опция для получения необработанных значений
+        ).execute()
+
         values = result.get('values', [])
+
+        if not values:
+            logger.warning("Получены пустые данные из таблицы")
+            return None
+
+        df = pd.DataFrame(values[1:], columns=values[0])
+        logger.info(f"Успешно получено {len(df)} строк данных")
+        return df
+
     except Exception as e:
-        logger.error("google_sheets_error", error=str(e))
+        logger.error(f"Ошибка при получении данных из Google Sheets: {str(e)}")
+        logger.debug(f"Подробности ошибки: {traceback.format_exc()}")
         return None
-
-    df = pd.DataFrame(values[2:], columns=values[0])
-
-    # Заменяем пустые строки и None на NaN
-    df = df.replace(['', None], pd.NA)
-    # Заполняем все пустые значения фразой "Нет значения"
-    df = df.fillna("Нет значения")
-    return df
 
 async def save_to_database(df, db_name, product_data_table='product_data_ozon1', primary_key_cols=None):
     """Записывает данные из DataFrame в таблицу базы данных, обновляя и удаляя существующие записи"""

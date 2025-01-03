@@ -7,20 +7,19 @@ from datetime import datetime
 import signal
 import aiohttp
 import json
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Set
 from scr.logger import logger
 from scr.data_writer import write_sheet_data
 from scr.data_fetcher import get_sheet_data
 from scr.yandex_market_report import get_yandex_market_report
-from scr.update_data_ym import compare_prices_and_create_for_update, update_dataframe
+from scr.update_data_ym import compare_prices_and_create_for_update, update_dataframe, first_write_df
 from scr.update_ym import update_price_ym
 
-
-
-# Флаг для корректного завершения программы
+# Глобальные переменные для управления состоянием
 is_running = True
+active_tasks: Set[asyncio.Task] = set()
+shutdown_event = asyncio.Event()
 DEBUG = True
-
 
 class MarketplaceConfig:
     def __init__(self,
@@ -68,6 +67,8 @@ async def save_debug_csv(df: pd.DataFrame, filename: str) -> None:
 async def process_yandex_market_data(session: aiohttp.ClientSession, config: MarketplaceConfig) -> Dict[str, Any]:
     """Обработка данных Яндекс.Маркета"""
     ym_logger = logger.bind(marketplace="YandexMarket")
+    ym_flag = None
+    sheets_flag = None
 
     # Валидация входных данных
     if not all([config.sample_spreadsheet_id, config.market_name, config.yandex_market_range,
@@ -98,95 +99,155 @@ async def process_yandex_market_data(session: aiohttp.ClientSession, config: Mar
             'link': 'LINK',
             'price': 'MERCH_PRICE_WITH_PROMOS',
             'stop': 'STOP',
-            'mp_on_market': 'PRICE.1',
+            'mp_on_market': 'PRICE_VALUE_ON_MARKET',
             'market_with_mp': 'SHOP_WITH_BEST_PRICE_ON_MARKET',
             'prim': 'PRIM'
         }
 
         COLUMNS_TO_KEEP = [
-            'SHOP_SKU', 'OFFER', 'MAIN_PRICE', 'MERCH_PRICE_WITH_PROMOS',
-            'PRICE_GREEN_THRESHOLD', 'PRICE_RED_THRESHOLD', 'PRICE_WITH_PROMOS',
-            'SHOP_WITH_BEST_PRICE_ON_MARKET', 'PRICE.1'
+            'SHOP_SKU', 'OFFER','MERCH_PRICE_WITH_PROMOS',
+            'PRICE_GREEN_THRESHOLD', 'PRICE_RED_THRESHOLD',
+            'SHOP_WITH_BEST_PRICE_ON_MARKET', 'PRICE_VALUE_ON_MARKET'
         ]
         SQLITE_DB_NAME = f"databases/{market_config['safe_user_name']}_data_{market_config['safe_market_name']}.db"
         try:
             # Получение данных из Google Sheets
             ym_logger.info(f"Получение данных из Google Sheets для {market_config['range_name']}")
-            df = await get_sheet_data(market_config['spreadsheet_id'], market_config['sheet_range'])
-
+            df_from_sheets = await get_sheet_data(market_config['spreadsheet_id'], market_config['sheet_range'])
+            sheets_flag = True
             current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-            await save_debug_csv(df, f"report/{market_config['range_name']}{current_time}_first.csv")
+            await save_debug_csv(df_from_sheets, f"report/{market_config['range_name']}{current_time}_first.csv")
         except Exception as e:
+            sheets_flag = False
             ym_logger.error(f"Не удалось получить данные из Гугл таблиц для пользователя {config.user_id} "
                             f"с email {config.user_email}")
-            raise
 
-            # Получение отчета с Яндекс.Маркета
+
+        # Получение отчета с Яндекс.Маркета
         try:
             ym_report_df = await get_yandex_market_report(market_config['api_key'], market_config['business_id'])
-            ym_report_df = await asyncio.to_thread(
-                lambda: ym_report_df[COLUMNS_TO_KEEP].dropna(subset=['PRICE.1'])
-            )
+            # Проверяем наличие колонок и логируем отсутствующие
+            missing_columns = [col for col in COLUMNS_TO_KEEP if col not in ym_report_df.columns]
+            if missing_columns:
+                logger.warning(
+                    f"Следующие колонки отсутствуют в полученном отчете: {', '.join(missing_columns)}",
+                    extra={
+                        'market_name': config.market_name,
+                        'user_name': config.user_id
+                    }
+                )
+
+            # Фильтруем датафрейм, оставляя только те колонки, которые есть и в COLUMNS_TO_KEEP, и в датафрейме
+            available_columns = [col for col in COLUMNS_TO_KEEP if col in ym_report_df.columns]
+            ym_report_df = ym_report_df[available_columns]
+
+            # Проверяем наличие колонки 'PRICE_VALUE_ON_MARKET' перед выполнением dropna
+            if 'PRICE_VALUE_ON_MARKET' in ym_report_df.columns:
+                ym_report_df = await asyncio.to_thread(
+                    lambda: ym_report_df.dropna(subset=['PRICE_VALUE_ON_MARKET'])
+                )
+            else:
+                logger.warning(
+                    "Колонка 'PRICE_VALUE_ON_MARKET' отсутствует в отчете, пропускаем удаление NA значений",
+                    extra={
+                        'market_name': config.market_name,
+                        'user_name': config.user_id
+                    }
+                )
             await save_debug_csv(ym_report_df, f"report/{market_config['range_name']}{current_time}_ym_report.csv")
+            ym_flag = True
         except Exception as e:
+            ym_flag = False
             ym_logger.error(f"Ошибка при получении отчета с Яндекс.Маркета: {str(e)}")
             raise
 
-            # Обновление и сравнение данных
-        try:
-            updated_df = await update_dataframe(df, ym_report_df, COLUMNS_FULL)
-            updated_df, for_update_df = await compare_prices_and_create_for_update(
-                df = updated_df,
-                column_names =COLUMNS_FULL,
-                my_market=my_market,
-                db_file=SQLITE_DB_NAME,
-                username=config.user_id,
-                marketname=config.market_name,
-                min_price_diff=config.price_decrease_lower,
-                max_price_diff=config.price_decrease_upper
+        if ym_flag == True and sheets_flag == False:
+            df_for_write = await first_write_df(ym_report_df)
+            ym_logger.warning(
+                f"Таблица Google пуста для клиента {config.user_id}, записываю данные из личного кабинета"
             )
+            # Создаем копию DataFrame
+            df_to_write = df_for_write.copy()
+            # Получаем названия колонок
+            column_names = pd.DataFrame([df_to_write.columns.tolist()], columns=df_to_write.columns)
+            # Сначала добавляем названия колонок, затем данные
+            df_to_write = pd.concat([column_names, df_to_write], axis=0, ignore_index=True)
 
             await write_sheet_data(
-                updated_df,
-                market_config['spreadsheet_id'],
-                market_config['sheet_range'].replace('1', '3')
+                df_to_write,
+                config.sample_spreadsheet_id,
+                config.yandex_market_range
             )
-        except Exception as e:
-            ym_logger.error(f"Ошибка при обновлении и сравнении данных: {str(e)}")
-            raise
 
-            # Обновление цен через API
-        if not for_update_df.empty:
-            ym_logger.warning(f"Обновление цен через API для {market_config['range_name']}", importance="high")
+        if ym_flag == True and sheets_flag == True:
+            # Обновление и сравнение данных
             try:
-                await update_price_ym(
-                    for_update_df,
-                    market_config['api_key'],
-                    market_config['business_id'],
-                    "SHOP_SKU",
-                    "MERCH_PRICE_WITH_PROMOS",
-                    'discount_base',
-                    debug=DEBUG
-                )
-                ym_logger.warning("Завершено обновление цен через API")
+                df_from_sheets = df_from_sheets.iloc[1:].copy()
+
+                updated_df = await update_dataframe(df1=df_from_sheets,
+                                                    df2=ym_report_df,
+                                                    column_names=COLUMNS_FULL,
+                                                    user_name=config.user_id,
+                                                    market_name=config.market_name)
+                updated_df.to_csv(f"{config.market_name}.csv")
             except Exception as e:
-                ym_logger.error(f"Ошибка при обновлении цен через API: {str(e)}")
+                ym_logger.error(f"Ошибка при обновлении данных: {str(e)}")
+                raise
+            try:
+                updated_df_final, for_update_df = await compare_prices_and_create_for_update(
+                    df=updated_df,
+                    column_names =COLUMNS_FULL,
+                    my_market=my_market,
+                    db_file=SQLITE_DB_NAME,
+                    username=config.user_id,
+                    marketname=config.market_name,
+                    min_price_diff=config.price_decrease_lower,
+                    max_price_diff=config.price_decrease_upper
+                )
+
+                await write_sheet_data(
+                    updated_df_final,
+                    market_config['spreadsheet_id'],
+                    market_config['sheet_range'].replace('1', '3')
+                )
+            except Exception as e:
+                ym_logger.error(f"Ошибка при сравнении данных: {str(e)}")
                 raise
 
+            # Обновление цен через API
+            if not for_update_df.empty:
+                ym_logger.warning(f"Обновление цен через API для {market_config['range_name']}", importance="high")
+                try:
+                    await update_price_ym(
+                        for_update_df,
+                        market_config['api_key'],
+                        market_config['business_id'],
+                        "SHOP_SKU",
+                        "MERCH_PRICE_WITH_PROMOS",
+                        'discount_base',
+                        debug=DEBUG,
+                        marketname=config.market_name,
+                        username=config.user_id
+                    )
+                    ym_logger.warning("Завершено обновление цен через API")
+                except Exception as e:
+                    ym_logger.error(f"Ошибка при обновлении цен через API: {str(e)}")
+                    raise
 
-        try:
-            await save_debug_csv(updated_df, f"report_ym/{market_config['range_name']}{current_time}_updated.csv")
-            await save_debug_csv(for_update_df, f"report_ym/{market_config['range_name']}{current_time}_for_update.csv")
-        except Exception as e:
-            ym_logger.info('Не удалось сохранить один из датафреймов')
 
-        ym_logger.info(f"Обработка завершена успешно для {market_config['range_name']}")
-        return {
-            'status': 'success',
-            'marketplace': 'YandexMarket',
-            'rows_processed': len(df),
-            'rows_updated': len(for_update_df)
-        }
+            try:
+                await save_debug_csv(updated_df, f"report_ym/{market_config['range_name']}{current_time}_updated.csv")
+                await save_debug_csv(for_update_df, f"report_ym/{market_config['range_name']}{current_time}_for_update.csv")
+            except Exception as e:
+                ym_logger.info('Не удалось сохранить один из датафреймов')
+
+            ym_logger.info(f"Обработка завершена успешно для {market_config['range_name']}")
+            return {
+                'status': 'success',
+                'marketplace': 'YandexMarket',
+                'rows_processed': len(df_from_sheets),
+                'rows_updated': len(for_update_df)
+            }
 
     except Exception as e:
         error_details = {
@@ -276,7 +337,7 @@ async def process_marketplace_data(config: MarketplaceConfig):
     user_info = config.get_user_info()
     try:
         async with aiohttp.ClientSession() as session:
-            while is_running:
+            while is_running and not shutdown_event.is_set():
                 start_time = datetime.now()
                 logger.warning(f"🔄 Начало обработки данных для пользователя {user_info}")
 
@@ -288,31 +349,68 @@ async def process_marketplace_data(config: MarketplaceConfig):
                         result = await process_yandex_market_data(session, config)
                         results.append(result)
 
-
                     logger.info(f"✅ Завершена обработка данных для пользователя {user_info}")
                     logger.debug(f"Результаты обработки: {json.dumps(results, indent=2)}")
 
                 except Exception as e:
                     logger.error(f"❌ Ошибка при обработке данных для пользователя {user_info}: {str(e)}")
 
-                # Вычисляем время до следующего запуска
+                if shutdown_event.is_set():
+                    logger.info(f"🛑 Получен сигнал завершения для пользователя {user_info}")
+                    break
+
+                    # Вычисляем время до следующего запуска
                 processing_time = (datetime.now() - start_time).total_seconds()
                 sleep_time = max(0, math.ceil(config.update_interval_minutes) * 60 - processing_time)
 
-                logger.info(f"💤 Пользователь {user_info} -ожидание {sleep_time:.1f} секунд до следующего обновления")
-                await asyncio.sleep(sleep_time)
+                try:
+                    logger.info(
+                        f"💤 Пользователь {user_info} - ожидание {sleep_time:.1f} секунд до следующего обновления")
+                    await asyncio.wait_for(shutdown_event.wait(), timeout=sleep_time)
+                    break  # Если получили событие завершения, прерываем цикл
+                except asyncio.TimeoutError:
+                    continue  # Если таймаут истек, продолжаем работу
 
     except asyncio.CancelledError:
         logger.info(f"🛑 Задача для пользователя {user_info} была отменена")
     except Exception as e:
         logger.error(f"❌ Критическая ошибка в обработке данных для пользователя {user_info}: {str(e)}")
+    finally:
+        logger.info(f"🏁 Задача для пользователя {user_info} завершена")
+
+
+async def shutdown(signal_name):
+    """Корректное завершение всех задач"""
+    global is_running
+    logger.warning(f"🛑 Получен сигнал {signal_name}. Начинаем корректное завершение...")
+
+    is_running = False
+    shutdown_event.set()
+
+    # Ждем завершения текущих задач с таймаутом
+    if active_tasks:
+        logger.info(f"⏳ Ожидание завершения {len(active_tasks)} активных задач...")
+        try:
+            await asyncio.wait(active_tasks, timeout=30)  # 30 секунд на завершение
+        except Exception as e:
+            logger.error(f"❌ Ошибка при ожидании завершения задач: {e}")
+
+            # Принудительная отмена незавершенных задач
+        remaining_tasks = {t for t in active_tasks if not t.done()}
+        if remaining_tasks:
+            logger.warning(f"⚠️ Принудительное завершение {len(remaining_tasks)} задач")
+            for task in remaining_tasks:
+                task.cancel()
+
+            await asyncio.wait(remaining_tasks)
+
+    logger.warning("✅ Все задачи завершены")
 
 
 def handle_shutdown(signum, frame):
     """Обработчик сигналов завершения"""
-    global is_running
-    logger.info("🛑 Получен сигнал завершения. Начинаем корректное завершение всех задач...")
-    is_running = False
+    signal_name = signal.Signals(signum).name
+    asyncio.create_task(shutdown(signal_name))
 
 
 async def main():
@@ -323,22 +421,29 @@ async def main():
         logger.info(f"🚀 Запуск обработки данных для {len(user_configs)} пользователей")
 
         # Создаем и запускаем задачи для всех пользователей
-        tasks = []
         for config in user_configs:
             task = asyncio.create_task(
                 process_marketplace_data(config),
                 name=f"task_{config.user_id}"
             )
-            tasks.append(task)
+            active_tasks.add(task)
+            task.add_done_callback(active_tasks.discard)
             logger.info(f"✨ Создана задача для пользователя {config.get_user_info()}")
 
-        # Ждем завершения всех задач
-        logger.info("⚡ Все задачи запущены. Нажмите Ctrl+C для остановки.")
-        await asyncio.gather(*tasks, return_exceptions=True)
+            # Ждем завершения всех задач или сигнала завершения
+        while active_tasks and is_running:
+            done, _ = await asyncio.wait(active_tasks, timeout=1)
+            for task in done:
+                try:
+                    await task
+                except Exception as e:
+                    logger.error(f"❌ Ошибка в задаче: {e}")
 
     except Exception as e:
-        logger.error(f"❌Ошибка в главной функции: {str(e)}")
+        logger.error(f"❌ Ошибка в главной функции: {str(e)}")
     finally:
+        if active_tasks:
+            await shutdown("FINAL")
         logger.info("🏁 Работа программы завершена")
 
 

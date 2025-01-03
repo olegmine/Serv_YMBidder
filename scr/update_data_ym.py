@@ -6,7 +6,7 @@ import random
 import asyncio
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict
+from typing import Dict, Tuple, List
 from scr.logger import logger
 
 # Настройка логирования
@@ -21,44 +21,118 @@ async def run_in_executor(func, *args):
     return await loop.run_in_executor(executor, func, *args)
 
 
-async def update_dataframe(df1: pd.DataFrame, df2: pd.DataFrame, column_names: Dict[str, str]) -> pd.DataFrame:
+async def update_dataframe(df1: pd.DataFrame, df2: pd.DataFrame, column_names: Dict[str, str], user_name: str,
+                           market_name: str) -> pd.DataFrame:
     """
-    Асинхронно обновляет первый DataFrame данными из второго DataFrame на основе seller_id.
-
-    :param df1: Первый DataFrame
-    :param df2: Второй DataFrame
-    :param column_names: Словарь с названиями колонок
-    :return: Обновленный DataFrame
+    Асинхронно обновляет первый DataFrame данными из второго DataFrame.
     """
-
     def update_df():
-        df1_updated = df1.copy()
-        df2_updated = df2.copy()
+        def standardize_shop_sku(value):
+            """Стандартизация значений SHOP_SKU"""
+            if pd.isna(value):
+                return value
+            # Преобразуем в строку и убираем пробелы
+            str_value = str(value).strip()
+            # Удаляем ведущие нули и снова приводим к строке
+            str_value = str(int(str_value)) if str_value.isdigit() else str_value
+            return str_value
 
-        seller_id = column_names['seller_id']
-        mp_on_market = column_names['mp_on_market']
-        market_with_mp = column_names['market_with_mp']
+        try:
+            # Сбрасываем индекс, если он не является значимым
+            df1_updated = df1.reset_index(drop=True) if not isinstance(df1.index, pd.MultiIndex) else df1.copy()
+            df2_updated = df2.reset_index(drop=True) if not isinstance(df2.index, pd.MultiIndex) else df2.copy()
 
-        df1_updated[seller_id] = df1_updated[seller_id].astype(str)
-        df2_updated[seller_id] = df2_updated[seller_id].astype(str)
+            # Логируем начальное состояние
+            logger.debug(
+                f"Исходные значения SHOP_SKU в df1:\n{df1_updated[['SHOP_SKU', 'OFFER']].to_dict('records')}",
+                extra={'user_name': user_name, 'market_name': market_name}
+            )
 
-        merged_df = df1_updated.merge(df2_updated[[seller_id, mp_on_market, market_with_mp]],
-                                      on=seller_id,
-                                      how='left',
-                                      suffixes=('', '_new'))
+            # Стандартизируем SHOP_SKU
+            df1_updated['SHOP_SKU'] = df1_updated['SHOP_SKU'].apply(standardize_shop_sku)
+            df2_updated['SHOP_SKU'] = df2_updated['SHOP_SKU'].apply(standardize_shop_sku)
 
-        merged_df[mp_on_market] = merged_df[f'{mp_on_market}_new'].fillna(merged_df[mp_on_market])
-        merged_df[market_with_mp] = merged_df[f'{market_with_mp}_new'].fillna(merged_df[market_with_mp])
+            # Логируем состояние после стандартизации
+            logger.debug(
+                f"Значения SHOP_SKU после стандартизации:\n{df1_updated[['SHOP_SKU', 'OFFER']].to_dict('records')}",
+                extra={'user_name': user_name, 'market_name': market_name}
+            )
 
-        merged_df = merged_df.drop([f'{mp_on_market}_new', f'{market_with_mp}_new'], axis=1)
+            # Проверяем дубликаты до слияния
+            duplicates_df1 = df1_updated[df1_updated.duplicated(subset=['SHOP_SKU'], keep=False)]
+            if not duplicates_df1.empty:
+                logger.warning(
+                    f"Найдены дубликаты в первом DataFrame:\n{duplicates_df1[['SHOP_SKU', 'OFFER']].to_dict('records')}",
+                    extra={'user_name': user_name, 'market_name': market_name}
+                )
+                # Оставляем только первую запись для каждого дубликата
+                df1_updated = df1_updated.drop_duplicates(subset=['SHOP_SKU'], keep='first')
 
-        original_type = df1[seller_id].dtype
-        merged_df[seller_id] = merged_df[seller_id].astype(original_type)
+            # Определяем колонки для обновления
+            update_columns = [
+                column_names[key] for key in [
+                    'name', 'link', 'price', 'stop', 'mp_on_market',
+                    'market_with_mp', 'prim'
+                ] if key in column_names and column_names[key] in df2_updated.columns
+            ]
 
-        return merged_df
+            # Добавляем дополнительные колонки
+            additional_columns = [
+                'PRICE_GREEN_THRESHOLD',
+                'PRICE_RED_THRESHOLD'
+            ]
+            update_columns.extend([
+                col for col in additional_columns
+                if col in df2_updated.columns
+            ])
+
+            # Выполняем слияние
+            merged_df = pd.merge(
+                df1_updated,
+                df2_updated[['SHOP_SKU'] + update_columns],
+                on='SHOP_SKU',
+                how='outer',
+                suffixes=('', '_new')
+            )
+
+            # Обновляем значения
+            for col in update_columns:
+                if f'{col}_new' in merged_df.columns:
+                    merged_df[col] = merged_df[f'{col}_new'].fillna(merged_df[col])
+                    merged_df = merged_df.drop(columns=[f'{col}_new'])
+
+            # Заполняем пустые значения
+            merged_df = merged_df.fillna(pd.NA)
+
+            # Финальная проверка на дубликаты
+            final_duplicates = merged_df.duplicated(subset=['SHOP_SKU'], keep=False)
+            if final_duplicates.any():
+                logger.error(
+                    f"Финальные дубликаты:\n{merged_df[final_duplicates][['SHOP_SKU', 'OFFER']].to_dict('records')}",
+                    extra={'user_name': user_name, 'market_name': market_name}
+                )
+                merged_df = merged_df.drop_duplicates(subset=['SHOP_SKU'], keep='first')
+
+            # Проверяем финальное состояние
+            logger.debug(
+                f"Финальное состояние:\n{merged_df[['SHOP_SKU', 'OFFER']].to_dict('records')}\n"  
+                f"Количество уникальных SHOP_SKU: {merged_df['SHOP_SKU'].nunique()}",
+                extra={'user_name': user_name, 'market_name': market_name}
+            )
+
+            return merged_df
+
+        except Exception as e:
+            logger.error(
+                f"Ошибка при обработке DataFrame: {str(e)}\n"  
+                f"Текущее состояние данных:\n"  
+                f"df1 shape: {df1.shape}\n"  
+                f"df2 shape: {df2.shape}",
+                extra={'user_name': user_name, 'market_name': market_name}
+            )
+            raise
 
     return await run_in_executor(update_df)
-
 
 async def compare_prices_and_create_for_update(
         df: pd.DataFrame,
@@ -199,36 +273,71 @@ async def compare_prices_and_create_for_update(
             stop = row[column_names['stop']]
             shop_with_best_price = row[column_names['market_with_mp']]
 
-            if shop_with_best_price in my_market:
-                return old_price, f"Цена не изменена. У одного из ваших магазинов ({shop_with_best_price}) уже минимальная цена на рынке.", None
+            if mp_on_market - old_price > max_price_diff:
+                preliminary_price = mp_on_market - random.randint(min_price_diff, max_price_diff)
+                new_price = max(preliminary_price, stop)
 
-            price_difference = old_price - mp_on_market
+                if new_price == stop:
+                    message = (
+                        f"Цена была значительно ниже рыночной ({old_price:.2f} << {mp_on_market:.2f}). "
+                        f"Расчетная цена была ниже stop, установлена в stop: {new_price:.2f}"
+                    )
+                else:
+                    message = (
+                        f"Цена была значительно ниже рыночной ({old_price:.2f} << {mp_on_market:.2f}). "
+                        f"Увеличена до {new_price:.2f} (mp_on_market - случайное число от {min_price_diff} до {max_price_diff})"
+                    )
 
-            if price_difference > max_price_diff:
-                min_new_price = max(mp_on_market - max_price_diff, stop)
-                max_new_price = mp_on_market - min_price_diff
+                new_discount_base = round(random.uniform(new_price * 1.3, new_price * 1.6), 0)
+                return (
+                    new_price,
+                    f"{message}. Новая discount_base: {new_discount_base:.2f}",
+                    new_discount_base
+                )
+
+            # Новая логика: если текущая цена ниже stop
+            if old_price < stop:
+                price_increase = random.randint(20, 50)
+                new_price = stop + price_increase
+                new_discount_base = round(random.uniform(new_price * 1.3, new_price * 1.6), 0)
+                return (
+                    new_price,
+                    f"Цена была ниже stop ({old_price:.2f} < {stop:.2f}). "
+                    f"Увеличена до stop + {price_increase} = {new_price:.2f}. "
+                    f"Новая discount_base: {new_discount_base:.2f}",
+                    new_discount_base
+                )
             else:
-                min_new_price = max(mp_on_market - min_price_diff, stop)
-                max_new_price = mp_on_market - 1
+                if shop_with_best_price in my_market:
+                    return old_price, f"Цена не изменена. У одного из ваших магазинов ({shop_with_best_price}) уже минимальная цена на рынке.", None
 
-            if min_new_price >= max_new_price:
-                return old_price, (
-                    f"Цена не изменена. Некорректный диапазон цен. "
-                    f"Текущая цена: {old_price:.2f}, mp_on_market: {mp_on_market:.2f}, "
-                    f"stop: {stop:.2f}"
-                ), None
+                price_difference = old_price - mp_on_market
 
-            new_price = max(random.randint(int(min_new_price), int(max_new_price)), int(stop))
-            new_discount_base = round(random.uniform(new_price * 1.3, new_price * 1.6), 0)
+                if price_difference > max_price_diff:
+                    min_new_price = max(mp_on_market - max_price_diff, stop)
+                    max_new_price = mp_on_market - min_price_diff
+                else:
+                    min_new_price = max(mp_on_market - min_price_diff, stop)
+                    max_new_price = mp_on_market - 1
 
-            return (
-                new_price,
-                f"Цена изменена с {old_price:.2f} на {new_price:.2f}. "
-                f"Новая discount_base: {new_discount_base:.2f} "
-                f"(mp_on_market: {mp_on_market:.2f}, "
-                f"диапазон: {min_new_price:.2f} - {max_new_price:.2f})",
-                new_discount_base
-            )
+                if min_new_price >= max_new_price:
+                    return old_price, (
+                        f"Цена не изменена. Некорректный диапазон цен. "
+                        f"Текущая цена: {old_price:.2f}, mp_on_market: {mp_on_market:.2f}, "
+                        f"stop: {stop:.2f}"
+                    ), None
+
+                new_price = max(random.randint(int(min_new_price), int(max_new_price)), int(stop))
+                new_discount_base = round(random.uniform(new_price * 1.3, new_price * 1.6), 0)
+
+                return (
+                    new_price,
+                    f"Цена изменена с {old_price:.2f} на {new_price:.2f}. "
+                    f"Новая discount_base: {new_discount_base:.2f} "
+                    f"(mp_on_market: {mp_on_market:.2f}, "
+                    f"диапазон: {min_new_price:.2f} - {max_new_price:.2f})",
+                    new_discount_base
+                )
 
         except Exception as e:
             logger.error(
@@ -252,7 +361,7 @@ async def compare_prices_and_create_for_update(
 
             # Проверка на пустые значения в колонке 'stop'
         empty_stop_mask = updated_df[column_names['stop']].isna()
-        updated_df.loc[empty_stop_mask, column_names['prim']] = "Пустое значение в колонке 'stop'"
+        updated_df.loc[empty_stop_mask, column_names['prim']] = "Пустое значение в колонке 'STOP' данный товар исключен из обработки Биддера"
 
         # Добавляем записи с пустыми stop в failed_attempts
         if empty_stop_mask.any():
@@ -277,6 +386,7 @@ async def compare_prices_and_create_for_update(
         mask = (
                 (updated_df[column_names['price']] > updated_df[column_names['mp_on_market']]) &
                 (updated_df[column_names['mp_on_market']] > updated_df[column_names['stop']]) &
+                (updated_df[column_names['price']] < updated_df[column_names['stop']]) |
                 (~empty_stop_mask)
         )
 
@@ -395,45 +505,54 @@ async def compare_prices_and_create_for_update(
         raise
 
 
-        # async def main():
-#     # Определение названий колонок
-#     column_names = {
-#         'seller_id': 'SHOP_SKU',
-#         'name': 'OFFER',
-#         'link': 'LINK',
-#         'price': 'MERCH_PRICE_WITH_PROMOS',
-#         'stop': 'STOP',
-#         'mp_on_market': 'PRICE.1',
-#         'market_with_mp': 'SHOP_WITH_BEST_PRICE_ON_MARKET',
-#         'prim': 'PRIM'
-#     }
-#
-#     # Пример использования:
-#     df1 = pd.read_csv('report_old.csv')
-#     df1['LINK'] =''
-#     df2 = pd.read_csv('report_old — копия.csv')
-#
-#
-#     # Обновляем df1 данными из df2
-#     updated_df = await update_dataframe(df1, df2, column_names)
-#     print("Обновленный DataFrame:")
-#     print(updated_df)
-#     print("\nТипы данных:")
-#     print(updated_df.dtypes)
-#
-#     # Создаем DataFrame for_update и логируем случаи, когда mp_on_market ниже stop
-#     updated_df, for_update_df = await compare_prices_and_create_for_update(updated_df, column_names)
-#     for_update_df.to_csv('for_updated.csv')
-#     updated_df.to_csv('updated.csv')
-#     print("\nDataFrame for_update:")
-#     print(for_update_df)
-#     print(updated_df)
-#
-#     await run_in_executor(for_update_df.to_csv, 'report/reported2.txt')
-#
-#     df = await run_in_executor(pd.read_csv, 'report/reported22.txt')
-#     print(df.info())
+import pandas as pd
+import asyncio
 
 
-# if __name__ == "__main__":
-#     asyncio.run(main())
+async def first_write_df(df: pd.DataFrame) -> pd.DataFrame:
+    # Словарь с описаниями колонок
+    column_descriptions = {
+        'SHOP_SKU': 'Идентификатор товара в магазине',
+        'OFFER': 'Название Предложения',
+        'MERCH_PRICE_WITH_PROMOS': 'Цена с учетом промо-акций продавца',
+        'PRICE_GREEN_THRESHOLD': 'Зеленый порог цены',
+        'PRICE_RED_THRESHOLD': 'Красный порог цены',
+        'SHOP_WITH_BEST_PRICE_ON_MARKET': 'Магазин с лучшей ценой на рынке',
+        'PRICE_VALUE_ON_MARKET': 'Значение цены на рынке',
+        'PRIM': 'Примечание',
+        'LINK': 'Ссылка на товар',
+        'STOP': 'Ограничитель цены'
+    }
+
+    # Порядок колонок
+    column_order = [
+        'SHOP_SKU',
+        'OFFER',
+        'LINK',
+        'MERCH_PRICE_WITH_PROMOS',
+        'PRICE_GREEN_THRESHOLD',
+        'PRICE_RED_THRESHOLD',
+        'SHOP_WITH_BEST_PRICE_ON_MARKET',
+        'PRICE_VALUE_ON_MARKET',
+        'STOP',
+        'PRIM'
+    ]
+
+    # Создаем копию датафрейма
+    new_df = df.copy()
+
+    # Добавляем новую колонку prim
+    new_df['PRIM'] = 'Нет значения'
+    new_df['LINK'] = 'Нет значения'
+    new_df['STOP'] = 'Нет значения'
+
+    # Создаем строку с описаниями
+    descriptions = pd.DataFrame([column_descriptions])
+
+    # Объединяем описания с данными
+    result_df = pd.concat([descriptions, new_df], ignore_index=True)
+
+    # Переупорядочиваем колонки
+    result_df = result_df[column_order]
+
+    return result_df

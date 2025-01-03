@@ -1,59 +1,54 @@
-import os.path
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from .logger import logger
+from pathlib import Path
+from google.oauth2 import service_account
+from typing import Optional
+import sys
+import os
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from scr.logger import logger
+
+
+class GoogleServiceAuthManager:
+    SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+    def __init__(self):
+        self.base_dir = Path(__file__).parent.parent
+        self.config_dir = self.base_dir / 'scr'/"access"
+        self.service_account_path = self.config_dir / "service-account.json"
+
+        # Создаём директорию если её нет
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+
+    async def ensure_credentials_exist(self) -> None:
+        """Проверяет наличие файла service-account.json"""
+        if not self.service_account_path.exists():
+            logger.error(f"Файл service-account.json не найден: {self.service_account_path}")
+            raise FileNotFoundError(
+                f"Файл service-account.json должен быть размещен в: {self.service_account_path}\n"
+                "Получите его в Google Cloud Console -> IAM & Admin -> Service Accounts"
+            )
+
+    async def get_credentials(self):
+        """Получает учетные данные из файла service-account.json"""
+        logger.info("Запуск процесса получения учетных данных сервисного аккаунта")
+
+        await self.ensure_credentials_exist()
+
+        try:
+            credentials = service_account.Credentials.from_service_account_file(
+                str(self.service_account_path),
+                scopes=self.SCOPES
+            )
+            logger.info("Учетные данные сервисного аккаунта успешно загружены")
+            return credentials
+        except Exception as e:
+            logger.error(f"Ошибка при загрузке учетных данных сервисного аккаунта: {e}")
+            raise
+
+        # Пример использования
 
 
 async def get_credentials():
-    logger.info("Запуск функции get_credentials")
-
-    # Получаем абсолютный путь к директории, где находится этот скрипт
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-
-    # Определяем пути к файлам относительно директории скрипта
-    token_path = os.path.join(script_dir, "acsess/token.json")
-    credentials_path = os.path.join(script_dir, "acsess/credentials.json")
-
-    creds = None
-    if os.path.exists(token_path):
-        logger.debug(f"Найден существующий файл token.json: {token_path}")
-        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-        logger.info("Загружены учетные данные из token.json")
-
-    if not creds or not creds.valid:
-        logger.info("Учетные данные отсутствуют или недействительны")
-        if creds and creds.expired and creds.refresh_token:
-            logger.info("Обновление просроченных учетных данных")
-            try:
-                creds.refresh(Request())
-                logger.info("Учетные данные успешно обновлены")
-            except Exception as e:
-                logger.error(f"Не удалось обновить учетные данные: {str(e)}")
-        else:
-            logger.info("Инициация нового процесса аутентификации")
-            try:
-                if not os.path.exists(credentials_path):
-                    logger.error(f"Файл credentials.json не найден по пути: {credentials_path}")
-                    raise FileNotFoundError(f"Файл credentials.json не найден по пути: {credentials_path}")
-
-                flow = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES)
-                creds = flow.run_local_server(port=0)
-                logger.info("Получены новые учетные данные через локальный сервер")
-            except Exception as e:
-                logger.error(f"Не удалось получить новые учетные данные: {str(e)}")
-                raise
-
-        logger.debug(f"Сохранение новых учетных данных в {token_path}")
-        try:
-            with open(token_path, "w") as token:
-                token.write(creds.to_json())
-            logger.info("Новые учетные данные сохранены в token.json")
-        except Exception as e:
-            logger.error(f"Не удалось сохранить учетные данные в token.json: {str(e)}")
-
-    logger.info("Учетные данные успешно получены")
-    return creds
+    auth_manager = GoogleServiceAuthManager()
+    return await auth_manager.get_credentials()
 
